@@ -1,123 +1,143 @@
-# client.py
 #!/usr/bin/env python3
-import asyncio, json, ssl, time
+import os, json, ssl, time, getpass, hashlib, hmac, asyncio
+from pathlib import Path
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+import websockets, basefwx
 from mnemonic import Mnemonic
 from ecdsa import SigningKey, SECP256k1
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.backends import default_backend
-import websockets
+from cryptography.hazmat.primitives import hashes; from cryptography.hazmat.backends import default_backend
 
-# ───────────────────────────────────────────────────────────────
-# CONFIG & YOUR SEED
-# ───────────────────────────────────────────────────────────────
-NODE_URI    = "wss://xmr.fixcraft.org:8765"
-CA_BUNDLE   = None     # or "ca_bundle.pem"
-SEED_PHRASE = "vibrant cousin radio license border wonder mirror guitar arrange joy bench rent" #"light deer eye apple media hip giant hurdle people truth pigeon poem"
-LANG        = "english"  # your seed is English
-# ───────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────
+NODE        = "wss://xmr.fixcraft.org:8765"
+HIST_FILE   = ".wallet_history"
+W_FWX       = Path("wallet.fwx")
+W_PLAIN     = Path("wallet")               # staging
+OWNER_TAG   = "OWNER"
+BURN_TAGS   = {"BURN","DESTROY"}
 
-# derive 32‑byte ECDSA key
-def derive_sk_vk(seed_phrase):
-    seed = Mnemonic(LANG).to_seed(seed_phrase, passphrase="")
-    skb  = HKDF(hashes.SHA256(),length=32,salt=None,
-                info=b"ecdsa_spend",backend=default_backend()).derive(seed)
-    sk = SigningKey.from_string(skb, curve=SECP256k1)
-    return sk, sk.get_verifying_key()
+session = PromptSession(history=FileHistory(HIST_FILE))
 
-# same address_from_pubkey logic!
-ADDRESS_ALPHABET    = '0123456789ABab'
-ADDRESS_PREFIX_TMPL = "Fx8{}"
-ADDRESS_SUFFIX_TMPL = "v{}H"
-ADDRESS_LENGTH      = 34
-import hmac, hashlib
-def address_from_pubkey(pub_bytes: bytes) -> str:
-    d1 = (hmac.new(pub_bytes,b"addr_digit1",hashlib.sha256).digest()[0]%9)+1
-    d2 = (hmac.new(pub_bytes,b"addr_digit2",hashlib.sha256).digest()[0]%9)+1
-    pre = ADDRESS_PREFIX_TMPL.format(d1)
-    suf = ADDRESS_SUFFIX_TMPL.format(d2)
-    body = HKDF(hashes.SHA256(),length=ADDRESS_LENGTH-len(pre)-len(suf),
-                salt=None,info=b"addr_middle",backend=default_backend()).derive(pub_bytes)
-    return pre + ''.join(ADDRESS_ALPHABET[b%len(ADDRESS_ALPHABET)] for b in body) + suf
+# ── Key helpers ───────────────────────────────────────────────────────
+def hkdf(seed:bytes,info:bytes,n:int=32)->bytes:
+    return HKDF(hashes.SHA256(), n, None, info, backend=default_backend()).derive(seed)
 
-# sign helper
-def sign_transaction(tx, sk):
-    msg    = json.dumps(tx, sort_keys=True).encode()
-    digest = hashlib.sha256(msg).digest()
-    sig    = sk.sign_digest(digest)
-    return {
-        "transaction": tx,
-        "signature": sig.hex(),
-        "pub_key": sk.get_verifying_key().to_string().hex()
-    }
+def derive_keys(seed_phrase:str):
+    seed = Mnemonic("english").to_seed(seed_phrase)
+    sk   = SigningKey.from_string(hkdf(seed,b"ecdsa_spend"), curve=SECP256k1)
+    vk_b = sk.get_verifying_key().to_string()
+    addr = addr_from_pub(vk_b)
+    # chain‑style spend keys (64 chars)
+    mid_priv = hkdf(seed,b"priv_spend",60).hex()[:60]
+    mid_pub  = hkdf(seed,b"pub_spend",60).hex() [:60]
+    priv = "AAAA"+mid_priv+"eZ"
+    pub  = "AAAA"+mid_pub +"eQ"
+    return sk, addr, priv, pub
 
+def addr_from_pub(pub:bytes)->str:
+    d1=(hmac.new(pub,b"addr_digit1",hashlib.sha256).digest()[0]%9)+1
+    d2=(hmac.new(pub,b"addr_digit2",hashlib.sha256).digest()[0]%9)+1
+    pre=f"Fx8{d1}"; suf=f"v{d2}H"; mid_len=34-len(pre)-len(suf)
+    body=hkdf(pub,b"addr_middle",mid_len)
+    alpha="0123456789ABab"
+    mid=''.join(alpha[b%14] for b in body)
+    return pre+mid+suf
+
+def sign(tx,sk):
+    digest=hashlib.sha256(json.dumps(tx,sort_keys=True).encode()).digest()
+    return {"transaction":tx,"signature":sk.sign_digest(digest).hex(),
+            "pub_key":sk.get_verifying_key().to_string().hex()}
+
+# ── Wallet load/create (sync) ─────────────────────────────────────────
+def load_wallet():
+    if W_FWX.exists():
+        pw=getpass.getpass("Wallet Password: ")
+        try: basefwx.fwxAES(str(W_FWX),pw)
+        except SystemExit: print("❌ Wrong password."); exit(1)
+        data=json.loads(W_PLAIN.read_text())
+        W_PLAIN.unlink(missing_ok=True)
+        return data
+    print("🆕 Create Wallet")
+    pw    = getpass.getpass("New Password: ")
+    seed  = Mnemonic("english").generate(128)
+    sk,addr,priv,pub = derive_keys(seed)
+    wallet={"seed":seed,"address":addr,"priv_spend":priv,"pub_spend":pub}
+    W_PLAIN.write_text(json.dumps(wallet))
+    basefwx.fwxAES(str(W_PLAIN),pw)
+    W_PLAIN.unlink(missing_ok=True)
+    print("\n🎉 Wallet Created!")
+    print(f"🧬 Seed Phrase:       {seed}")
+    print(f"🔑 Wallet Address:    {addr}")
+    print(f"🔒 Private Spend Key: {priv}")
+    print(f"🔓 Public Spend Key:  {pub}\n")
+    return wallet
+
+wallet=load_wallet()
+SK        = derive_keys(wallet["seed"])[0]
+MY_ADDR   = wallet["address"]
+
+# ── Async main loop ───────────────────────────────────────────────────
 async def main():
-    # derive keys & address
-    sk, vk = derive_sk_vk(SEED_PHRASE)
-    me     = address_from_pubkey(vk.to_string())
-    print(f"🔑 Wallet Address: {me}")
+    # fetch genesis
+    ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
+    async with websockets.connect(NODE,ssl=ctx) as ws:
+        await ws.send(json.dumps({"command":"genesis"}))
+        GENESIS=await ws.recv()
+    print(f"💼 Address: {MY_ADDR}   |   Genesis: {GENESIS}")
+    print("💡 Type `help` for commands.\n")
 
-    # build SSL context
-    ssl_ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-    if CA_BUNDLE:
-        ssl_ctx.load_verify_locations(cafile=CA_BUNDLE)
-    else:
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode    = ssl.CERT_NONE
-
-    async with websockets.connect(NODE_URI, ssl=ssl_ctx) as ws:
-        print("🤖 Type `help` for commands.")
+    async with websockets.connect(NODE,ssl=ctx) as ws:
         while True:
-            cmd = input("> ").strip().split()
-            if not cmd:
-                continue
-            c = cmd[0].lower()
+            try: line=await session.prompt_async("> ")
+            except (EOFError,KeyboardInterrupt): print("\n👋"); break
+            parts=line.strip().split()
+            if not parts: continue
+            cmd=parts[0].lower()
 
-            if c in ("exit","quit"):
-                print("👋 Bye!")
-                break
+            if cmd in ("exit","quit"): break
 
-            if c in ("help","?"):
-                print("📖 Commands:\n  balance\n  send <to> <amount>\n  help\n  exit")
-                continue
-
-            if c == "balance":
-                await ws.send(json.dumps({"command":"balance","address":me}))
-                resp = await ws.recv()
-                try:
-                    d = json.loads(resp)
-                    print(f"💰 Balance: {d['balance']}   🔢 Nonce: {d['nonce']}")
-                except:
-                    print("⚠️ Unexpected reply:", resp)
+            if cmd in ("help","?"):
+                print("Commands:\n"
+                      "  balance\n  send <to> <amount>\n"
+                      "  sweep <to|OWNER|BURN>\n  security\n  exit")
                 continue
 
-            if c == "send":
-                if len(cmd)!=3:
-                    print("⚠️ Usage: send <to> <amount>")
-                    continue
-                to_addr = cmd[1]
-                amount  = float(cmd[2])
-                # fetch fresh nonce
-                await ws.send(json.dumps({"command":"balance","address":me}))
-                reply = await ws.recv()
-                data  = json.loads(reply)
-                nonce = data["nonce"]
-
-                tx = {
-                    "from": me,
-                    "to":   to_addr,
-                    "amount": amount,
-                    "nonce":  nonce,
-                    "timestamp": int(time.time())
-                }
-                signed = sign_transaction(tx, sk)
-                print(f"✍️  Sending {amount} → {to_addr} (nonce={nonce})")
-                await ws.send(json.dumps(signed))
-                result = await ws.recv()
-                print("📡 Server Reply:", result)
+            if cmd=="security":
+                print(f"\n🧬 Seed Phrase:       {wallet['seed']}\n"
+                      f"🔑 Wallet Address:    {wallet['address']}\n"
+                      f"🔒 Private Spend Key: {wallet['priv_spend']}\n"
+                      f"🔓 Public Spend Key:  {wallet['pub_spend']}\n")
                 continue
 
-            print("❓ Unknown command. Type `help`.")
+            if cmd=="balance":
+                await ws.send(json.dumps({"command":"balance","address":MY_ADDR}))
+                bal=json.loads(await ws.recv())
+                print(f"💰 Balance: {bal['balance']}   🔢 Nonce: {bal['nonce']}")
+                continue
+
+            # send / sweep
+            if cmd=="send" and len(parts)==3:
+                dest, amt = parts[1], float(parts[2])
+            elif cmd=="sweep" and len(parts)==2:
+                dest=parts[1]
+                await ws.send(json.dumps({"command":"balance","address":MY_ADDR}))
+                amt=float(json.loads(await ws.recv())["balance"])
+                print(f"🔄 Sweep {amt} → {dest}")
+            else:
+                print("❓ Bad syntax."); continue
+
+            if dest.upper()==OWNER_TAG: dest=GENESIS
+            if dest.upper() in BURN_TAGS: dest=""
+
+            await ws.send(json.dumps({"command":"balance","address":MY_ADDR}))
+            nonce = json.loads(await ws.recv())["nonce"]
+
+            tx={"from":MY_ADDR,"to":dest,"amount":amt,"nonce":nonce,
+                "timestamp":int(time.time())}
+            await ws.send(json.dumps(sign(tx,SK)))
+            print("📡",await ws.recv())
 
 if __name__=="__main__":
     asyncio.run(main())

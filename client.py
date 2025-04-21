@@ -156,10 +156,18 @@ async def cli_loop():
         # send / sweep
         if c=="send" and len(cmd)==3:
             dest, amt = cmd[1], float(cmd[2])
+            if dest.upper() == OWNER_TAG:
+                print(f"🎉 Donating {amt} CPX")
+            elif dest.upper() in BURN_TAGS:
+                print(f"♻️ Deleting {amt} CPX")
+            else:
+                print(f"📤 Sending {amt} CPX → {dest}")
         elif c=="sweep" and len(cmd)==2:
             dest = cmd[1]
             bal = await rpc("get_balance",[MY_ADDR]); amt = bal["balance"]
-            print(f"🔄 Sweeping {amt} → {dest}")
+            if dest.upper() == OWNER_TAG: print(f"🎉 Donating {amt} CPX")
+            elif dest.upper() in BURN_TAGS: print(f"♻️ Deleting {amt} CPX")
+            else: print(f"🔄 Sweeping {amt} CPX → {dest}")
         else:
             print("❓ Unknown CMD"); continue
 

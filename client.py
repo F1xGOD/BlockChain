@@ -85,7 +85,12 @@ def load_or_create_wallet(restore_seed: str|None):
 
     if FWX_WALLET.exists():
         pw=getpass.getpass("Wallet Password: ")
-        if basefwx.fwxAES(str(FWX_WALLET),pw)=="FAIL!": print("❌"); exit(1)
+        if basefwx.fwxAES(str(FWX_WALLET),pw)=="FAIL!":
+            print("Retrying...")
+            if basefwx.fwxAES(str(FWX_WALLET)) == "FAIL!":
+                print("❌")
+                exit(1)
+            print("✅ Recovered! 🎉")
         data=json.loads(WALLET_PLAIN.read_text()); basefwx.fwxAES(str(WALLET_PLAIN),pw)
         return data,pw
 

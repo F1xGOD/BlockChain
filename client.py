@@ -3,6 +3,7 @@ import ssl, json, time, asyncio, getpass, hashlib, hmac, argparse, sys, os
 from pathlib import Path
 import aiohttp
 import basefwx
+from tqdm import tqdm
 from mnemonic import Mnemonic
 from ecdsa import SigningKey, SECP256k1
 from cryptography.hazmat.primitives import serialization
@@ -254,7 +255,95 @@ async def fetch_chain():
             async with s.get(f"{RPC_URL}/block/{h}", ssl=sslctx) as r2:
                 blocks.append(await r2.json())
         return blocks
+async def initial_sync():
+    if OFFLINE_MODE:
+        return
 
+    # 1) fetch chain tip
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(f"{RPC_URL}/height", ssl=sslctx) as resp:
+            resp.raise_for_status()
+            height = (await resp.json())["height"]
+
+    # 2) load cache
+    cache = load_cache()
+    last   = cache.get("last_height", -1)
+
+    to_sync = height - last
+    if to_sync <= 0:
+        print("✅ Already up to date.")
+        return
+
+    print(f"🔄 Synchronizing {to_sync} new blocks…")
+    bar = tqdm(total=to_sync, unit="blk")
+    async with aiohttp.ClientSession() as sess:
+        for h in range(last + 1, height + 1):
+            async with sess.get(f"{RPC_URL}/block/{h}", ssl=sslctx) as resp2:
+                resp2.raise_for_status()
+                blk = await resp2.json()
+
+            # — your per-block cache logic (same as in your transactions command) —
+            # 1) coinbase
+            if blk.get("txs"):
+                cb = blk["txs"][0]
+                if "transaction" in cb:
+                    enc = cb["transaction"]
+                    to_ = ecies_decrypt(PRIV_VIEW, enc["to"]).decode()
+                    amt = float(ecies_decrypt(PRIV_VIEW, enc["amount"]).decode())
+                    ts_ = int(ecies_decrypt(PRIV_VIEW, enc["timestamp"]).decode())
+                else:
+                    to_, amt, ts_ = cb["to"], cb["amount"], blk["ts"]
+                if to_ == MY_ADDR:
+                    cache.setdefault("rewards", []).append({
+                        "height": h, "to": to_, "amount": amt, "ts": ts_
+                    })
+
+            # 2) user txs
+            for w in blk.get("txs", [])[1:]:
+                if "transaction" in w:
+                    enc = w["transaction"]
+                    frm = ecies_decrypt(PRIV_VIEW, enc["from"]).decode()
+                    to_ = ecies_decrypt(PRIV_VIEW, enc["to"]).decode()
+                    amt = float(ecies_decrypt(PRIV_VIEW, enc["amount"]).decode())
+                    ts_ = int(ecies_decrypt(PRIV_VIEW, enc["timestamp"]).decode())
+                    fee = w.get("fee", 0)
+                else:
+                    frm, to_, amt, ts_, fee = (
+                        w.get("from",""), w.get("to",""),
+                        w.get("amount",0), blk["ts"], w.get("fee",0)
+                    )
+
+                if frm == MY_ADDR or to_ == MY_ADDR:
+                    cache.setdefault("confirmed", []).append({
+                        "from":  frm, "to": to_,
+                        "amount":amt, "fee": fee,
+                        "height":h, "ts": ts_
+                    })
+
+            bar.update(1)
+
+    bar.close()
+    cache["last_height"] = height
+
+    # 3) refresh pending
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(f"{RPC_URL}/mempool", ssl=sslctx) as rmp:
+            pool = await rmp.json()
+
+    cache["pending"] = []
+    for w in pool:
+        tx = w.get("transaction", w)
+        frm, to_ = tx.get("from",""), tx.get("to","")
+        if frm == MY_ADDR or to_ == MY_ADDR:
+            cache["pending"].append({
+                "from": frm, "to": to_,
+                "amount": tx.get("amount",0),
+                "fee":    w.get("fee",0),
+                "ts":     tx.get("timestamp",0)
+            })
+
+    save_cache(cache)
+    print("✅ Synchronization complete.")
 async def calculate_state():
     blocks = await fetch_chain()
     STATE_, NONCES_ = {}, {}
@@ -294,6 +383,7 @@ async def calculate_state():
     return STATE_, NONCES_
 
 async def cli_loop():
+    await initial_sync()
     asyncio.create_task(background_sync())
     print_formatted_text(f"💼 Address: {MY_ADDR}  |  ⛓️🌐 Loaded")
     while True:

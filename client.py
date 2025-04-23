@@ -132,10 +132,10 @@ def load_or_create_wallet(restore_seed):
 
     if FWX_WALLET.exists():
         pw = getpass.getpass("Wallet Password: ")
-        if basefwx.fwxAES(str(FWX_WALLET), pw) == "FAIL!":
+        if basefwx.fwxAES(str(FWX_WALLET), pw, False) == "FAIL!":
             print("❌ Bad password"); sys.exit(1)
         data = json.loads(WALLET_PLAIN.read_text())
-        basefwx.fwxAES(str(WALLET_PLAIN), pw)
+        basefwx.fwxAES(str(WALLET_PLAIN), pw, False)
         return data, pw
 
     # new wallet
@@ -150,7 +150,7 @@ def load_or_create_wallet(restore_seed):
         "priv_view":  pv_s, "pub_view":  pv_p
     }
     WALLET_PLAIN.write_text(json.dumps(wallet))
-    basefwx.fwxAES(str(WALLET_PLAIN), pw)
+    basefwx.fwxAES(str(WALLET_PLAIN), pw, False)
     print_formatted_text(f"🎉 Wallet Created!\n🧬 {seed}\n📬 {addr}")
     return wallet, pw
 
@@ -381,7 +381,31 @@ async def calculate_state():
                 STATE_[to]   = STATE_.get(to, 0) + amt
 
     return STATE_, NONCES_
-
+def detect_language(phrase: str) -> str:
+    """
+    Try to infer which mnemonic wordlist the user’s seed phrase is using.
+    1) If _all_ words appear in one of our supported lists, pick that.
+    2) Otherwise fall back to langdetect and map its code to our lists.
+    """
+    phrase = phrase.strip().lower()
+    words = phrase.split()
+    # 1) exact match in a supported Mnemonic wordlist
+    for lang in LANGUAGES:
+        m = Mnemonic(lang)
+        if all(w in m.wordlist for w in words):
+            return lang
+    # 2) fallback via langdetect
+    code = detect(phrase)  # e.g. 'en','ru','ja'
+    return {"en": "english", "ru": "russian", "ja": "japanese"}.get(code, "english")
+def translate_seed(phrase, target):
+    phrase = phrase.lower().strip()
+    if target not in LANGUAGES:
+        raise ValueError(f"Unknown language: {target}")
+    src = detect_language(phrase)
+    ms  = Mnemonic(src)
+    if not ms.check(phrase):
+        raise ValueError("Bad checksum")
+    return Mnemonic(target).to_mnemonic(ms.to_entropy(phrase))
 async def cli_loop():
     await initial_sync()
     asyncio.create_task(background_sync())
@@ -393,7 +417,28 @@ async def cli_loop():
         c=cmd[0].lower()
         if c in ("exit","quit"): break
         if c in ("help","?"):
-            print("balance | send <to> <amt> | sweep <to> | transactions | exit")
+            print("balance | send <to> <amt> | sweep <to> | security | language <lang> | transactions | exit")
+            continue
+        if c == "language" and len(cmd) == 2:
+            tgt = cmd[1].lower()
+            if tgt not in LANGUAGES:
+                print("❓ Supported languages:", ", ".join(sorted(LANGUAGES)))
+                continue
+
+            try:
+                # translate your seed phrase into the target wordlist
+                new_seed = translate_seed(wallet["seed"], tgt)
+            except ValueError as e:
+                print(f"❌ Translation failed: {e}")
+                continue
+
+            # re-encrypt your wallet file with the same password
+            wallet["seed"] = new_seed
+            basefwx.fwxAES(str(FWX_WALLET), wallet_pw, False)
+            WALLET_PLAIN.write_text(json.dumps(wallet))
+            basefwx.fwxAES(str(WALLET_PLAIN), wallet_pw, False)
+
+            print("✅ Seed language updated to", tgt)
             continue
 
         if c == "balance":

@@ -378,43 +378,33 @@ async def initial_sync():
 
     save_cache(cache)
     print("✅ Synchronization complete.")
-async def calculate_state():
-    blocks = await fetch_chain()
-    STATE_, NONCES_ = {}, {}
+def calculate_state():
+    """
+    Build STATE and NONCES from your on-disk cache only.
+    No network I/O, no decryption hell.
+    """
+    cache = load_cache()
+    STATE = {}
+    NONCES = {}
 
-    for blk in blocks:
-        for w in blk.get("txs", []):
-            # 1) unwrap either a signed‐wrapper or a raw/coinbase tx
-            if isinstance(w, dict) and "transaction" in w:
-                # normal tx
-                tx_enc = w["transaction"]
-                fee    = w.get("fee", 0)
-                # decrypt the encrypted fields
-                tx = {}
-                for fld in ("from", "to", "amount", "timestamp"):
-                    pt = ecies_decrypt(PRIV_VIEW, tx_enc[fld]).decode()
-                    if fld == "amount":
-                        tx[fld] = float(pt)
-                    elif fld == "timestamp":
-                        tx[fld] = int(pt)
-                    else:
-                        tx[fld] = pt
-                # nonce is unencrypted
-                tx["nonce"] = tx_enc.get("nonce", 0)
-            else:
-                # coinbase or any raw tx
-                tx  = w
-                fee = 0
+    # Apply mined rewards
+    for r in cache.get("rewards", []):
+        STATE[r["to"]] = STATE.get(r["to"], 0) + r["amount"]
 
-            # 2) apply to your in-memory state
-            frm, to, amt = tx.get("from", ""), tx.get("to", ""), tx.get("amount", 0)
-            if frm:
-                STATE_[frm]  = STATE_.get(frm, 0) - amt - fee
-                NONCES_[frm] = NONCES_.get(frm, 0) + 1
-            if to:
-                STATE_[to]   = STATE_.get(to, 0) + amt
+    # Apply confirmed txs
+    for t in cache.get("confirmed", []):
+        frm, to, amt, fee = t["from"], t["to"], t["amount"], t["fee"]
+        STATE[frm] = STATE.get(frm, 0) - (amt + fee)
+        STATE[to]  = STATE.get(to,  0) + amt
+        NONCES[frm] = NONCES.get(frm, 0) + 1
 
-    return STATE_, NONCES_
+    # Account for pending nonces
+    for p in cache.get("pending", []):
+        frm = p["from"]
+        NONCES[frm] = NONCES.get(frm, 0) + 1
+
+    return STATE, NONCES
+
 def detect_language(phrase: str) -> str:
     """
     Try to infer which mnemonic wordlist the user’s seed phrase is using.
@@ -626,7 +616,11 @@ async def cli_loop():
                 print("❌ Cancelled"); continue
 
             # build plain tx
-            nonce = (await calculate_state())[1].get(MY_ADDR, 0)
+            cache = load_cache()
+            nonce = sum(1 for t in cache.get("confirmed", [])
+                        if t["from"] == MY_ADDR) \
+                    + sum(1 for p in cache.get("pending", [])
+                          if p["from"] == MY_ADDR)
             tx = {
                 "from":      MY_ADDR,
                 "to":        dest,

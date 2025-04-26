@@ -216,6 +216,16 @@ except Exception as e:
     OFFLINE_MODE=True; print("🔌 Running in OFFLINE mode.")
 POLL_INTERVAL = 30  # seconds between background syncs
 
+
+def safe_decrypt(view_priv, enc_dict):
+    """
+    Try to decrypt an ECIES‐wrapped field.
+    Return decoded string on success, None on failure.
+    """
+    try:
+        return ecies_decrypt(view_priv, enc_dict).decode()
+    except Exception:
+        return None
 async def background_sync():
     while True:
         if not OFFLINE_MODE:
@@ -300,11 +310,17 @@ async def initial_sync():
                 cb = blk["txs"][0]
                 if "transaction" in cb:
                     enc = cb["transaction"]
-                    to_ = ecies_decrypt(PRIV_VIEW, enc["to"]).decode()
-                    amt = float(ecies_decrypt(PRIV_VIEW, enc["amount"]).decode())
-                    ts_ = int(ecies_decrypt(PRIV_VIEW, enc["timestamp"]).decode())
+                    to_ = safe_decrypt(PRIV_VIEW, enc["to"])
+                    amt_s = safe_decrypt(PRIV_VIEW, enc["amount"])
+                    ts_s = safe_decrypt(PRIV_VIEW, enc["timestamp"])
+                    fee = cb.get("fee", 0)
+                    if to_ is None or amt_s is None or ts_s is None:
+                        continue
+                    amt = float(amt_s)
+                    ts_ = int(ts_s)
                 else:
-                    to_, amt, ts_ = cb["to"], cb["amount"], blk["ts"]
+                    to_, amt, ts_, fee = cb["to"], cb["amount"], blk["ts"], 0
+
                 if to_ == MY_ADDR:
                     cache.setdefault("rewards", []).append({
                         "height": h, "to": to_, "amount": amt, "ts": ts_
@@ -314,23 +330,29 @@ async def initial_sync():
             for w in blk.get("txs", [])[1:]:
                 if "transaction" in w:
                     enc = w["transaction"]
-                    frm = ecies_decrypt(PRIV_VIEW, enc["from"]).decode()
-                    to_ = ecies_decrypt(PRIV_VIEW, enc["to"]).decode()
-                    amt = float(ecies_decrypt(PRIV_VIEW, enc["amount"]).decode())
-                    ts_ = int(ecies_decrypt(PRIV_VIEW, enc["timestamp"]).decode())
-                    fee = w.get("fee", 0)
+                    frm = safe_decrypt(PRIV_VIEW, enc["from"])
+                    to_ = safe_decrypt(PRIV_VIEW, enc["to"])
+                    amt_s = safe_decrypt(PRIV_VIEW, enc["amount"])
+                    ts_s = safe_decrypt(PRIV_VIEW, enc["timestamp"])
+                    fee = w.get("fee")
+                    if frm is None or to_ is None or amt_s is None or ts_s is None or fee is None:
+                        continue
+                    amt = float(amt_s)
+                    ts_ = int(ts_s)
                 else:
                     frm, to_, amt, ts_, fee = (
-                        w.get("from",""), w.get("to",""),
-                        w.get("amount",0), blk["ts"], w.get("fee",0)
+                        w.get("from", ""), w.get("to", ""),
+                        w.get("amount", 0), blk["ts"], w.get("fee", 0)
                     )
 
-                if frm == MY_ADDR or to_ == MY_ADDR:
-                    cache.setdefault("confirmed", []).append({
-                        "from":  frm, "to": to_,
-                        "amount":amt, "fee": fee,
-                        "height":h, "ts": ts_
-                    })
+                cache.setdefault("confirmed", []).append({
+                    "from": frm,
+                    "to": to_,
+                    "amount": amt,
+                    "fee": fee,
+                    "height": h,
+                    "ts": ts_
+                })
 
             bar.update(1)
 
@@ -478,28 +500,28 @@ async def cli_loop():
                             cb = blk["txs"][0]
                             if "transaction" in cb:
                                 enc = cb["transaction"]
-                                to_ = ecies_decrypt(PRIV_VIEW, enc["to"]).decode()
-                                amt = float(ecies_decrypt(PRIV_VIEW, enc["amount"]).decode())
-                            else:
-                                to_, amt = cb["to"], cb["amount"]
-                            if to_ == MY_ADDR:
-                                cache.setdefault("rewards", []).append({
-                                    "height": h, "to": to_, "amount": amt, "ts": blk["ts"]
-                                })
+                                to_ = safe_decrypt(PRIV_VIEW, enc["to"])
+                                amt_s = safe_decrypt(PRIV_VIEW, enc["amount"])
+                                ts_s = safe_decrypt(PRIV_VIEW, enc["timestamp"])
+                                # if any fail, this coinbase isn’t for you (shouldn’t happen) — skip
+                                if to_ is None or amt_s is None or ts_s is None:
+                                    continue
+                                amt = float(amt_s)
+                                ts_ = int(ts_s)
 
                         # ── user txs ───────────────────────────────────
                         for w in blk.get("txs", [])[1:]:
                             if "transaction" in w:
                                 enc = w["transaction"]
-                                frm = ecies_decrypt(PRIV_VIEW, enc["from"]).decode()
-                                to_ = ecies_decrypt(PRIV_VIEW, enc["to"]).decode()
-                                amt = float(ecies_decrypt(PRIV_VIEW, enc["amount"]).decode())
-                                fee = w.get("fee", 0)
-                            else:
-                                frm = w.get("from", "");
-                                to_ = w.get("to", "")
-                                amt = w.get("amount", 0);
-                                fee = w.get("fee", 0)
+                                frm = safe_decrypt(PRIV_VIEW, enc["from"])
+                                to_ = safe_decrypt(PRIV_VIEW, enc["to"])
+                                amt_s = safe_decrypt(PRIV_VIEW, enc["amount"])
+                                ts_s = safe_decrypt(PRIV_VIEW, enc["timestamp"])
+                                # if decryption fails, this tx isn’t for you—skip
+                                if frm is None or to_ is None or amt_s is None or ts_s is None:
+                                    continue
+                                amt = float(amt_s)
+                                ts_ = int(ts_s)
                             if frm == MY_ADDR or to_ == MY_ADDR:
                                 cache.setdefault("confirmed", []).append({
                                     "from": frm, "to": to_, "amount": amt,
@@ -661,11 +683,14 @@ async def cli_loop():
                             cb = blk["txs"][0]
                             if "transaction" in cb:
                                 enc = cb["transaction"]
-                                to_ = ecies_decrypt(PRIV_VIEW, enc["to"]).decode()
-                                amt = float(ecies_decrypt(PRIV_VIEW, enc["amount"]).decode())
-                                ts_ = int(ecies_decrypt(PRIV_VIEW, enc["timestamp"]).decode())
-                            else:
-                                to_, amt, ts_ = cb["to"], cb["amount"], blk["ts"]
+                                to_ = safe_decrypt(PRIV_VIEW, enc["to"])
+                                amt_s = safe_decrypt(PRIV_VIEW, enc["amount"])
+                                ts_s = safe_decrypt(PRIV_VIEW, enc["timestamp"])
+                                # if any fail, this coinbase isn’t for you (shouldn’t happen) — skip
+                                if to_ is None or amt_s is None or ts_s is None:
+                                    continue
+                                amt = float(amt_s)
+                                ts_ = int(ts_s)
                             if to_ == MY_ADDR:
                                 cache["rewards"].append({
                                     "height": h, "to": to_, "amount": amt, "ts": ts_
@@ -675,17 +700,15 @@ async def cli_loop():
                         for w in blk.get("txs", [])[1:]:
                             if "transaction" in w:
                                 enc = w["transaction"]
-                                frm = ecies_decrypt(PRIV_VIEW, enc["from"]).decode()
-                                to_ = ecies_decrypt(PRIV_VIEW, enc["to"]).decode()
-                                amt = float(ecies_decrypt(PRIV_VIEW, enc["amount"]).decode())
-                                ts_ = int(ecies_decrypt(PRIV_VIEW, enc["timestamp"]).decode())
-                                fee = w.get("fee", 0)
-                            else:
-                                frm = w.get("from", "")
-                                to_ = w.get("to", "")
-                                amt = w.get("amount", 0)
-                                ts_ = blk["ts"]
-                                fee = w.get("fee", 0)
+                                frm = safe_decrypt(PRIV_VIEW, enc["from"])
+                                to_ = safe_decrypt(PRIV_VIEW, enc["to"])
+                                amt_s = safe_decrypt(PRIV_VIEW, enc["amount"])
+                                ts_s = safe_decrypt(PRIV_VIEW, enc["timestamp"])
+                                # if decryption fails, this tx isn’t for you—skip
+                                if frm is None or to_ is None or amt_s is None or ts_s is None:
+                                    continue
+                                amt = float(amt_s)
+                                ts_ = int(ts_s)
 
                             if frm == MY_ADDR or to_ == MY_ADDR:
                                 cache["confirmed"].append({

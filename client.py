@@ -2,6 +2,7 @@
 import ssl, json, time, asyncio, getpass, hashlib, hmac, argparse, sys, os
 from pathlib import Path
 import aiohttp
+import traceback
 import basefwx
 from tqdm import tqdm
 from mnemonic import Mnemonic
@@ -149,12 +150,20 @@ def load_or_create_wallet(restore_seed):
         "priv_spend": ps,  "pub_spend": pu,
         "priv_view":  pv_s, "pub_view":  pv_p
     }
+    try:
+        wallet["windex"] = asyncio.run(get_chain_height())
+    except Exception:
+        wallet["windex"] = 0
     WALLET_PLAIN.write_text(json.dumps(wallet))
     basefwx.fwxAES(str(WALLET_PLAIN), pw, False)
     print_formatted_text(f"🎉 Wallet Created!\n🧬 {seed}\n📬 {addr}")
     return wallet, pw
 
-
+async def get_chain_height():
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(f"{RPC_URL}/height", ssl=sslctx) as resp:
+            resp.raise_for_status()
+            return (await resp.json()).get("height", 0)
 async def confirm_prompt():
     ans = await session_cli.prompt_async("\n✒️ Confirm? Y/n: ")
     return ans.strip().lower() in ("y","yes")
@@ -201,7 +210,9 @@ SK, MY_ADDR, PRIV_SPEND, PUB_SPEND, PRIV_VIEW, PUB_VIEW = derive_keys(wallet["se
 try:
     genesis = asyncio.run(rpc("get_genesis"))
     miner   = asyncio.run(rpc("get_miner"))
-except:
+except Exception as e:
+    print(f"❌ RPC init failed: {e}")  # show the error message
+    traceback.print_exc()
     OFFLINE_MODE=True; print("🔌 Running in OFFLINE mode.")
 POLL_INTERVAL = 30  # seconds between background syncs
 
@@ -268,7 +279,8 @@ async def initial_sync():
     # 2) load cache
     cache = load_cache()
     last   = cache.get("last_height", -1)
-
+    windex = wallet.get("windex", 0)
+    last = max(last, windex)
     to_sync = height - last
     if to_sync <= 0:
         print("✅ Already up to date.")
